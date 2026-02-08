@@ -14,6 +14,7 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.approvals import (
     requires_approval,
     format_args_preview,
+    allocate_approval_token,
     make_approval_prompt,
     parse_approval_message,
 )
@@ -235,11 +236,15 @@ class AgentLoop:
                         args_preview = format_args_preview(
                             tool_call.arguments, self.approval_config.detail
                         )
+                        approval_ref = allocate_approval_token(session.metadata)
                         approval_prompt = make_approval_prompt(
-                            tool_call.id, tool_call.name, args_preview
+                            approval_ref, tool_call.name, args_preview
                         )
                         session.metadata["pending_tool_approval"] = {
-                            "approval_id": tool_call.id,
+                            "approval_ref": approval_ref,
+                            "approval_ref_norm": approval_ref.lower(),
+                            "tool_call_id": tool_call.id,
+                            "tool_call_id_norm": tool_call.id.lower(),
                             "tool_name": tool_call.name,
                             "arguments": tool_call.arguments,
                             "assistant_content": response.content or "",
@@ -363,11 +368,15 @@ class AgentLoop:
                         args_preview = format_args_preview(
                             tool_call.arguments, self.approval_config.detail
                         )
+                        approval_ref = allocate_approval_token(session.metadata)
                         approval_prompt = make_approval_prompt(
-                            tool_call.id, tool_call.name, args_preview
+                            approval_ref, tool_call.name, args_preview
                         )
                         session.metadata["pending_tool_approval"] = {
-                            "approval_id": tool_call.id,
+                            "approval_ref": approval_ref,
+                            "approval_ref_norm": approval_ref.lower(),
+                            "tool_call_id": tool_call.id,
+                            "tool_call_id_norm": tool_call.id.lower(),
                             "tool_name": tool_call.name,
                             "arguments": tool_call.arguments,
                             "assistant_content": response.content or "",
@@ -442,10 +451,17 @@ class AgentLoop:
         pending: dict[str, Any],
     ) -> OutboundMessage:
         action = parse_approval_message(msg.content)
-        approval_id = pending.get("approval_id")
-        if not action or action[1] != approval_id:
+        approval_ref = pending.get("approval_ref") or "A?"
+        approval_ref_norm = pending.get("approval_ref_norm") or str(approval_ref).lower()
+        allowed_refs = {approval_ref_norm}
+        if pending.get("tool_call_id_norm"):
+            allowed_refs.add(pending["tool_call_id_norm"])
+        if pending.get("subagent_approval_id_norm"):
+            allowed_refs.add(pending["subagent_approval_id_norm"])
+
+        if not action or action[1] not in allowed_refs:
             prompt = pending.get("approval_prompt") or make_approval_prompt(
-                approval_id, pending.get("tool_name", "tool"), ""
+                approval_ref, pending.get("tool_name", "tool"), ""
             )
             return OutboundMessage(
                 channel=msg.channel,
@@ -460,7 +476,8 @@ class AgentLoop:
         session.metadata.pop("pending_tool_approval", None)
         self.sessions.save(session)
         if origin.get("type") == "subagent":
-            self.subagents.resolve_approval(approval_id, decision == "approve")
+            subagent_approval_id = pending.get("subagent_approval_id") or ""
+            self.subagents.resolve_approval(subagent_approval_id, decision == "approve")
             if decision == "approve":
                 return OutboundMessage(
                     channel=msg.channel,
@@ -495,7 +512,7 @@ class AgentLoop:
             history = history[:-1]
         messages.extend(history)
         tool_call = {
-            "id": pending["approval_id"],
+            "id": pending["tool_call_id"],
             "type": "function",
             "function": {
                 "name": pending["tool_name"],
@@ -507,7 +524,7 @@ class AgentLoop:
         )
         result = await self.tools.execute(pending["tool_name"], pending["arguments"])
         messages = self.context.add_tool_result(
-            messages, pending["approval_id"], pending["tool_name"], result
+            messages, pending["tool_call_id"], pending["tool_name"], result
         )
         iteration = 0
         final_content = None
@@ -538,11 +555,15 @@ class AgentLoop:
                         args_preview = format_args_preview(
                             tool_call.arguments, self.approval_config.detail
                         )
+                        approval_ref = allocate_approval_token(session.metadata)
                         approval_prompt = make_approval_prompt(
-                            tool_call.id, tool_call.name, args_preview
+                            approval_ref, tool_call.name, args_preview
                         )
                         session.metadata["pending_tool_approval"] = {
-                            "approval_id": tool_call.id,
+                            "approval_ref": approval_ref,
+                            "approval_ref_norm": approval_ref.lower(),
+                            "tool_call_id": tool_call.id,
+                            "tool_call_id_norm": tool_call.id.lower(),
                             "tool_name": tool_call.name,
                             "arguments": tool_call.arguments,
                             "assistant_content": response.content or "",
@@ -578,11 +599,12 @@ class AgentLoop:
     async def _handle_subagent_approval_request(self, msg: InboundMessage) -> OutboundMessage:
         import json as _json
         payload = _json.loads(msg.content)
-        approval_id = payload["approval_id"]
+        subagent_approval_id = payload["approval_id"]
         tool_name = payload["tool_name"]
         args_preview = payload.get("args_preview", "")
-        approval_prompt = make_approval_prompt(approval_id, tool_name, args_preview)
         session = self.sessions.get_or_create(payload["session_key"])
+        approval_ref = allocate_approval_token(session.metadata)
+        approval_prompt = make_approval_prompt(approval_ref, tool_name, args_preview)
         if session.metadata.get("pending_tool_approval"):
             return OutboundMessage(
                 channel=payload["channel"],
@@ -590,7 +612,10 @@ class AgentLoop:
                 content="Another approval is already pending. Please respond to it first.",
             )
         session.metadata["pending_tool_approval"] = {
-            "approval_id": approval_id,
+            "approval_ref": approval_ref,
+            "approval_ref_norm": approval_ref.lower(),
+            "subagent_approval_id": subagent_approval_id,
+            "subagent_approval_id_norm": subagent_approval_id.lower(),
             "tool_name": tool_name,
             "arguments": payload.get("arguments", {}),
             "assistant_content": "",
