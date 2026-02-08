@@ -2,5 +2,6 @@
 
 from nanobot.providers.base import LLMProvider, LLMResponse
 from nanobot.providers.litellm_provider import LiteLLMProvider
+from nanobot.providers.mock_provider import MockProvider
 
-__all__ = ["LLMProvider", "LLMResponse", "LiteLLMProvider"]
+__all__ = ["LLMProvider", "LLMResponse", "LiteLLMProvider", "MockProvider"]

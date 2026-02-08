@@ -359,6 +359,9 @@ Config file: `~/.nanobot/config.json`
 | `moonshot` | LLM (Moonshot/Kimi) | [platform.moonshot.cn](https://platform.moonshot.cn) |
 | `zhipu` | LLM (Zhipu GLM) | [open.bigmodel.cn](https://open.bigmodel.cn) |
 | `vllm` | LLM (local, any OpenAI-compatible server) | — |
+| `mock` | LLM (manual or RNG testing; no API key) | — |
+
+Use `mock/manual` or `mock/rng` as `agents.defaults.model` to activate the mock provider.
 
 <details>
 <summary><b>Adding a New Provider (Developer Guide)</b></summary>
