@@ -418,6 +418,39 @@ That's it! Environment variables, model prefixing, config matching, and `nanobot
 | `tools.restrictToWorkspace` | `false` | When `true`, restricts **all** agent tools (shell, file read/write/edit, list) to the workspace directory. Prevents path traversal and out-of-scope access. |
 | `channels.*.allowFrom` | `[]` (allow all) | Whitelist of user IDs. Empty = allow everyone; non-empty = only listed users can interact. |
 
+### Tool Approval
+
+You can require explicit approval before the agent runs specific tools.
+
+Add a `tools.approval` block in `~/.nanobot/config.json`:
+
+```json
+{
+  "tools": {
+    "approval": {
+      "required": ["exec", "write_file", "edit_file"],
+      "detail": "summary"
+    }
+  }
+}
+```
+
+When a gated tool is requested, the agent will pause and ask you to reply with:
+
+```
+approve <id>
+```
+
+Or to deny:
+
+```
+deny <id>
+```
+
+Options:
+- `required`: list of tool names to gate. Available built-ins: `read_file`, `write_file`, `edit_file`, `list_dir`, `exec`, `web_search`, `web_fetch`, `message`, `spawn`, `cron`.
+- `detail`: how much argument detail to show in the approval prompt. One of `summary` (default), `full`, or `minimal`.
+
 
 ## CLI Reference
 

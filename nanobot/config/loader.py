@@ -69,6 +69,11 @@ def _migrate_config(data: dict) -> dict:
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
+    approval_cfg = tools.get("approval", {})
+    if isinstance(approval_cfg, dict):
+        required = approval_cfg.get("required")
+        if isinstance(required, str):
+            approval_cfg["required"] = [required]
     return data
 
 

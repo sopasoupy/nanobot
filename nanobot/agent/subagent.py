@@ -15,6 +15,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
+from nanobot.agent.approvals import requires_approval, format_args_preview
 
 
 class SubagentManager:
@@ -35,8 +36,10 @@ class SubagentManager:
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        approval_config: "ToolApprovalConfig | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import ToolApprovalConfig
         self.provider = provider
         self.workspace = workspace
         self.bus = bus
@@ -44,7 +47,10 @@ class SubagentManager:
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.approval_config = approval_config or ToolApprovalConfig()
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
+        self._approval_events: dict[str, asyncio.Event] = {}
+        self._approval_decisions: dict[str, bool] = {}
     
     async def spawn(
         self,
@@ -154,6 +160,16 @@ class SubagentManager:
                     for tool_call in response.tool_calls:
                         args_str = json.dumps(tool_call.arguments)
                         logger.debug(f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}")
+                        if requires_approval(tool_call.name, self.approval_config):
+                            approved = await self._request_approval(
+                                task_id=task_id,
+                                tool_call=tool_call,
+                                origin=origin,
+                            )
+                            if not approved:
+                                final_result = "Tool execution was denied by the user."
+                                await self._announce_result(task_id, label, task, final_result, origin, "error")
+                                return
                         result = await tools.execute(tool_call.name, tool_call.arguments)
                         messages.append({
                             "role": "tool",
@@ -242,3 +258,43 @@ When you have completed the task, provide a clear summary of your findings or ac
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
         return len(self._running_tasks)
+
+    def resolve_approval(self, approval_id: str, approved: bool) -> None:
+        """Resolve a pending approval for a subagent tool call."""
+        event = self._approval_events.get(approval_id)
+        if not event:
+            return
+        self._approval_decisions[approval_id] = approved
+        event.set()
+
+    async def _request_approval(
+        self,
+        task_id: str,
+        tool_call: Any,
+        origin: dict[str, str],
+    ) -> bool:
+        approval_id = f"sub_{task_id}_{tool_call.id}"
+        event = asyncio.Event()
+        self._approval_events[approval_id] = event
+        args_preview = format_args_preview(
+            tool_call.arguments, self.approval_config.detail
+        )
+        payload = {
+            "approval_id": approval_id,
+            "tool_name": tool_call.name,
+            "arguments": tool_call.arguments,
+            "args_preview": args_preview,
+            "channel": origin["channel"],
+            "chat_id": origin["chat_id"],
+            "session_key": f"{origin['channel']}:{origin['chat_id']}",
+        }
+        msg = InboundMessage(
+            channel="system",
+            sender_id="subagent-approval",
+            chat_id=f"{origin['channel']}:{origin['chat_id']}",
+            content=json.dumps(payload),
+        )
+        await self.bus.publish_inbound(msg)
+        await event.wait()
+        self._approval_events.pop(approval_id, None)
+        return self._approval_decisions.pop(approval_id, False)

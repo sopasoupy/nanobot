@@ -105,10 +105,17 @@ class ExecToolConfig(BaseModel):
     timeout: int = 60
 
 
+class ToolApprovalConfig(BaseModel):
+    """Tool approval gate configuration."""
+    required: list[str] = Field(default_factory=list)
+    detail: str = "summary"  # summary | full | minimal
+
+
 class ToolsConfig(BaseModel):
     """Tools configuration."""
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    approval: ToolApprovalConfig = Field(default_factory=ToolApprovalConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
 
 

@@ -11,6 +11,12 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.approvals import (
+    requires_approval,
+    format_args_preview,
+    make_approval_prompt,
+    parse_approval_message,
+)
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from nanobot.agent.tools.shell import ExecTool
@@ -45,9 +51,11 @@ class AgentLoop:
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
+        approval_config: "ToolApprovalConfig | None" = None,
         session_manager: SessionManager | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
+        from nanobot.config.schema import ToolApprovalConfig
         from nanobot.cron.service import CronService
         self.bus = bus
         self.provider = provider
@@ -58,6 +66,7 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.approval_config = approval_config or ToolApprovalConfig()
         
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -70,6 +79,7 @@ class AgentLoop:
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            approval_config=self.approval_config,
         )
         
         self._running = False
@@ -161,6 +171,9 @@ class AgentLoop:
         
         # Get or create session
         session = self.sessions.get_or_create(msg.session_key)
+        pending = session.metadata.get("pending_tool_approval")
+        if pending:
+            return await self._handle_pending_approval(msg, session, pending)
         
         # Update tool contexts
         message_tool = self.tools.get("message")
@@ -216,8 +229,31 @@ class AgentLoop:
                     messages, response.content, tool_call_dicts
                 )
                 
-                # Execute tools
+                # Execute tools (with optional approval gate)
                 for tool_call in response.tool_calls:
+                    if requires_approval(tool_call.name, self.approval_config):
+                        args_preview = format_args_preview(
+                            tool_call.arguments, self.approval_config.detail
+                        )
+                        approval_prompt = make_approval_prompt(
+                            tool_call.id, tool_call.name, args_preview
+                        )
+                        session.metadata["pending_tool_approval"] = {
+                            "approval_id": tool_call.id,
+                            "tool_name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                            "assistant_content": response.content or "",
+                            "approval_prompt": approval_prompt,
+                            "origin": {"type": "agent"},
+                        }
+                        session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
+                        session.add_message("assistant", approval_prompt)
+                        self.sessions.save(session)
+                        return OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content=approval_prompt,
+                        )
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
@@ -255,6 +291,8 @@ class AgentLoop:
         the response back to the correct destination.
         """
         logger.info(f"Processing system message from {msg.sender_id}")
+        if msg.sender_id == "subagent-approval":
+            return await self._handle_subagent_approval_request(msg)
         
         # Parse origin from chat_id (format: "channel:chat_id")
         if ":" in msg.chat_id:
@@ -321,6 +359,29 @@ class AgentLoop:
                 )
                 
                 for tool_call in response.tool_calls:
+                    if requires_approval(tool_call.name, self.approval_config):
+                        args_preview = format_args_preview(
+                            tool_call.arguments, self.approval_config.detail
+                        )
+                        approval_prompt = make_approval_prompt(
+                            tool_call.id, tool_call.name, args_preview
+                        )
+                        session.metadata["pending_tool_approval"] = {
+                            "approval_id": tool_call.id,
+                            "tool_name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                            "assistant_content": response.content or "",
+                            "approval_prompt": approval_prompt,
+                            "origin": {"type": "agent"},
+                        }
+                        session.add_message("user", msg.content)
+                        session.add_message("assistant", approval_prompt)
+                        self.sessions.save(session)
+                        return OutboundMessage(
+                            channel=origin_channel,
+                            chat_id=origin_chat_id,
+                            content=approval_prompt,
+                        )
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
@@ -373,3 +434,173 @@ class AgentLoop:
         
         response = await self._process_message(msg)
         return response.content if response else ""
+
+    async def _handle_pending_approval(
+        self,
+        msg: InboundMessage,
+        session: "Session",
+        pending: dict[str, Any],
+    ) -> OutboundMessage:
+        action = parse_approval_message(msg.content)
+        approval_id = pending.get("approval_id")
+        if not action or action[1] != approval_id:
+            prompt = pending.get("approval_prompt") or make_approval_prompt(
+                approval_id, pending.get("tool_name", "tool"), ""
+            )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=prompt,
+            )
+        decision = action[0]
+        origin = pending.get("origin", {"type": "agent"})
+        approval_prompt = pending.get("approval_prompt")
+        if approval_prompt and session.messages and session.messages[-1].get("content") == approval_prompt:
+            session.messages.pop()
+        session.metadata.pop("pending_tool_approval", None)
+        self.sessions.save(session)
+        if origin.get("type") == "subagent":
+            self.subagents.resolve_approval(approval_id, decision == "approve")
+            if decision == "approve":
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Approval granted. The background task will continue.",
+                )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="Approval denied. The background task was canceled.",
+            )
+        if decision == "deny":
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="Approval denied. Tool execution canceled.",
+            )
+        return await self._execute_approved_tool(msg, session, pending)
+
+    async def _execute_approved_tool(
+        self,
+        msg: InboundMessage,
+        session: "Session",
+        pending: dict[str, Any],
+    ) -> OutboundMessage:
+        system_prompt = self.context.build_system_prompt()
+        system_prompt += f"\n\n## Current Session\nChannel: {msg.channel}\nChat ID: {msg.chat_id}"
+        messages = [{"role": "system", "content": system_prompt}]
+        history = session.get_history()
+        approval_prompt = pending.get("approval_prompt")
+        if approval_prompt and history and history[-1].get("content") == approval_prompt:
+            history = history[:-1]
+        messages.extend(history)
+        tool_call = {
+            "id": pending["approval_id"],
+            "type": "function",
+            "function": {
+                "name": pending["tool_name"],
+                "arguments": json.dumps(pending["arguments"]),
+            },
+        }
+        messages = self.context.add_assistant_message(
+            messages, pending.get("assistant_content", ""), [tool_call]
+        )
+        result = await self.tools.execute(pending["tool_name"], pending["arguments"])
+        messages = self.context.add_tool_result(
+            messages, pending["approval_id"], pending["tool_name"], result
+        )
+        iteration = 0
+        final_content = None
+        while iteration < self.max_iterations:
+            iteration += 1
+            response = await self.provider.chat(
+                messages=messages,
+                tools=self.tools.get_definitions(),
+                model=self.model,
+            )
+            if response.has_tool_calls:
+                tool_call_dicts = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments),
+                        },
+                    }
+                    for tc in response.tool_calls
+                ]
+                messages = self.context.add_assistant_message(
+                    messages, response.content, tool_call_dicts
+                )
+                for tool_call in response.tool_calls:
+                    if requires_approval(tool_call.name, self.approval_config):
+                        args_preview = format_args_preview(
+                            tool_call.arguments, self.approval_config.detail
+                        )
+                        approval_prompt = make_approval_prompt(
+                            tool_call.id, tool_call.name, args_preview
+                        )
+                        session.metadata["pending_tool_approval"] = {
+                            "approval_id": tool_call.id,
+                            "tool_name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                            "assistant_content": response.content or "",
+                            "approval_prompt": approval_prompt,
+                            "origin": {"type": "agent"},
+                        }
+                        session.add_message("assistant", approval_prompt)
+                        self.sessions.save(session)
+                        return OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content=approval_prompt,
+                        )
+                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    messages = self.context.add_tool_result(
+                        messages, tool_call.id, tool_call.name, result
+                    )
+            else:
+                final_content = response.content
+                break
+        if final_content is None:
+            final_content = "I've completed processing but have no response to give."
+        session.add_message("assistant", final_content)
+        self.sessions.save(session)
+        return OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=final_content,
+        )
+
+    async def _handle_subagent_approval_request(self, msg: InboundMessage) -> OutboundMessage:
+        import json as _json
+        payload = _json.loads(msg.content)
+        approval_id = payload["approval_id"]
+        tool_name = payload["tool_name"]
+        args_preview = payload.get("args_preview", "")
+        approval_prompt = make_approval_prompt(approval_id, tool_name, args_preview)
+        session = self.sessions.get_or_create(payload["session_key"])
+        if session.metadata.get("pending_tool_approval"):
+            return OutboundMessage(
+                channel=payload["channel"],
+                chat_id=payload["chat_id"],
+                content="Another approval is already pending. Please respond to it first.",
+            )
+        session.metadata["pending_tool_approval"] = {
+            "approval_id": approval_id,
+            "tool_name": tool_name,
+            "arguments": payload.get("arguments", {}),
+            "assistant_content": "",
+            "approval_prompt": approval_prompt,
+            "origin": {"type": "subagent"},
+        }
+        session.add_message("assistant", approval_prompt)
+        self.sessions.save(session)
+        return OutboundMessage(
+            channel=payload["channel"],
+            chat_id=payload["chat_id"],
+            content=approval_prompt,
+        )
